@@ -1,3 +1,5 @@
 claude_session.log
 claude_session_PID
 docker/tron-docker*.txt
+docker/container_session*
+
