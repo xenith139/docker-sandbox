@@ -63,13 +63,17 @@ if [ "$NO_ENTER" = true ]; then
     echo "Sent keys to session '$sessionId': $KEYS"
 else
     # Check if KEYS is a special key like Enter, Down, Up, etc.
+    # These are literal tmux key names, not regular text
     case "$KEYS" in
-        Enter|Down|Up|Left|Right|Tab|Escape|Space)
+        Enter|Down|Up|Left|Right|Tab|Escape|Space|BSpace|Home|End|PageUp|PageDown)
             tmux send-keys -t "$sessionId" "$KEYS"
             echo "Sent special key to session '$sessionId': $KEYS"
             ;;
         *)
-            tmux send-keys -t "$sessionId" "$KEYS" Enter
+            # All regular text (including "." or other short messages) gets Enter appended
+            # Use -l flag to send text literally, then send Enter as separate key
+            tmux send-keys -t "$sessionId" -l "$KEYS"
+            tmux send-keys -t "$sessionId" Enter
             echo "Sent command to session '$sessionId': $KEYS"
             ;;
     esac
